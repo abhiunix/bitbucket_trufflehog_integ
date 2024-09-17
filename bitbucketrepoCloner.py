@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+from typing import Optional
+import logging
+import re  
 import os
 import requests
 import json
@@ -7,6 +11,26 @@ import pytz
 import subprocess
 from dotenv import load_dotenv
 import shlex
+import csv
+
+
+# Load the project-repo mapping from the CSV file
+def load_project_repo_mapping(csv_file: str) -> dict:
+    project_repo_map = {}
+    with open(csv_file, mode='r') as file:
+        reader = csv.reader(file)
+        for row in reader:
+            project_key, repo_name = row
+            project_repo_map[repo_name.strip()] = project_key.strip()
+    return project_repo_map
+
+# Retrieve project key from CSV mapping
+def get_project_key_from_csv(repo_name: str, project_repo_map: dict) -> Optional[str]:
+    return project_repo_map.get(repo_name)
+
+# Import the createJIRA module
+from createJIRA import create_jira_ticket, get_issue_details
+import argparse
 
 # Load environment variables from .env file
 load_dotenv()
@@ -14,6 +38,7 @@ load_dotenv()
 BITBUCKET_APP_PASSWORD = os.getenv('BITBUCKET_APP_PASSWORD')
 BITBUCKET_USERNAME = os.getenv('BITBUCKET_USERNAME')
 BITBUCKET_WORKSPACE = os.getenv('BITBUCKET_WORKSPACE')
+JIRA_BASE_URL = os.getenv('JIRA_BASE_URL')
 
 # Directory where all repositories will be cloned
 REPOS_DIR = 'all_repos'
@@ -92,7 +117,7 @@ def get_repositories():
     return repos
 
 # Function to clone or update repositories
-def clone_or_update_repository(repo_slug, repo_name):
+def clone_or_update_repository(repo_slug, repo_name, project_repo_map):
     repo_path = os.path.join(REPOS_DIR, repo_name)
 
     # If the repo already exists locally, pull the latest changes
@@ -143,7 +168,8 @@ def clone_or_update_repository(repo_slug, repo_name):
             for modified_file in modified_files:
                 modified_file_path = os.path.join(repo_path, modified_file)
                 if os.path.isfile(modified_file_path):
-                    run_trufflehog_on_file(modified_file_path, repo_name)
+                    # Pass the project_repo_map here
+                    run_trufflehog_on_file(modified_file_path, repo_name, project_repo_map)
         else:
             print(f"No modified files found for {repo_name}.")
 
@@ -172,7 +198,7 @@ def clone_or_update_repository(repo_slug, repo_name):
         branch_info = next((branch for branch in branches if branch['name'] == branch_to_clone), None)
         if branch_info and 'target' in branch_info:
             latest_commit_hash = branch_info['target'].get('hash')
-
+            
             # Save the branch name and commit hash
             save_commit_hash(repo_name, branch_to_clone, latest_commit_hash)
             return True  # New repo cloned
@@ -180,37 +206,74 @@ def clone_or_update_repository(repo_slug, repo_name):
             print(f"Error: 'target' key missing for branch '{branch_to_clone}' in repository '{repo_name}'.")
             return False
 
-def run_trufflehog_on_file(file_path, repo_name):
+# Configure logging
+logging.basicConfig(
+    filename='bitbucketrepoCloner.log',
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s:%(message)s'
+)
+
+def run_trufflehog_on_file(file_path, repo_name, project_repo_map):
     print(f"Running TruffleHog on file: {file_path}")
     
-    # Save the result file in the all_repos folder
     result_file = os.path.join(REPOS_DIR, f"{repo_name}_th_results.txt")
     
     trufflehog_command = ["trufflehog", "filesystem", file_path, "--only-verified"]
     
-    # Run the TruffleHog command and save the results in the all_repos folder
     with open(result_file, 'w') as outfile:
         subprocess.run(trufflehog_command, stdout=outfile)
     
     print(f"TruffleHog results saved to {result_file}")
     
-    # Call the send_to_slack.py script to send the result to Slack
+    with open(result_file, 'r') as f:
+        trufflehog_output = f.read()
+    
+    trufflehog_output_cleaned = re.sub(r'^File: all_repos/', 'File: ', trufflehog_output, flags=re.MULTILINE)
+    
+    if trufflehog_output_cleaned.strip():
+        print(f"Secrets detected in {repo_name}!")
+    
+        alert_message = f":warning: *Potential secrets* found in repository `{repo_name}`.\nPlease review the attached results."
+        subprocess.run(['python3', 'send_to_slack.py', 'send_message', alert_message])
+    
+        bitbucket_url = f"https://bitbucket.org/{BITBUCKET_WORKSPACE}{repo_name}"
+    
+        summary = f"Potential secrets found in {repo_name}"
+        description = f"""**Issue Summary:** 
+We have detected potential secret(s) in your repository. These secrets may include sensitive data such as API keys, passwords, or other credentials that could pose a security risk if exposed.
+**Project Name:** 
+{repo_name}  
+**Bitbucket URL:**
+{bitbucket_url}  
+**Results:**
+```
+{trufflehog_output_cleaned}
+```
+**Potential Risks:**  
+Exposed secrets can be used for unauthorized access to systems, accounts, or services, leading to data breaches, system compromise, or other malicious activities.
+**Recommended Actions:**  
+- Kindly review the identified files to confirm the presence of secrets.
+- Remove the hardcoded credentials from the repositories.
+- Revoke the access from the exposed keys immediately.
+- Implement secret management best practices (e.g., AWS Secrets Managers).
+"""
+        labels = ["automation_scripts", "security_alert"]
+        
+        # Pass the repo_name and project_repo_map when creating a JIRA ticket
+        issue_key = create_jira_ticket(summary, description, repo_name, project_repo_map, issuetype="Bug", labels=labels)
+        
+        if issue_key:
+            issue_details = get_issue_details(issue_key)
+            if issue_details:
+                issue_url = f"{JIRA_BASE_URL}/browse/{issue_key}"
+                jira_message = f":jira: *JIRA Ticket Created*: <{issue_url}|{issue_key}> for repository `{repo_name}`."
+                subprocess.run(['python3', 'send_to_slack.py', 'send_message', jira_message])
+    else:
+        print(f"No secrets found by TruffleHog in {repo_name}.")
+    
     print(f"Sending {result_file} to Slack...")
-    subprocess.run(['python3', 'send_to_slack.py', result_file, repo_name])
+    subprocess.run(['python3', 'send_to_slack.py', 'send_file', result_file, repo_name])
 
-# Save repository info
-def save_repo_info(repos):
-    ist = pytz.timezone('Asia/Kolkata')
-    timestamp = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
-
-    info = {
-        "Total number of repositories found": len(repos),
-        "Timestamp in IST": timestamp,
-        "Repositories name": [repo['name'] for repo in repos]
-    }
-
-    with open('repo_info.json', 'w') as f:
-        json.dump(info, f, indent=4)
 
 # Function to clone repositories
 def clone_repository(repo_slug, repo_name):
@@ -246,7 +309,24 @@ def clone_repository(repo_slug, repo_name):
     print(f"Cloning branch '{escaped_branch_to_clone}' of repository '{repo_name}' (slug: '{repo_slug}')...")
     os.system(f'git clone --branch {escaped_branch_to_clone} "{repo_url}" "{repo_path}"')
 
+def save_repo_info(repos):
+    ist = pytz.timezone('Asia/Kolkata')
+    timestamp = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
+
+    info = {
+        "Total number of repositories found": len(repos),
+        "Timestamp in IST": timestamp,
+        "Repositories name": [repo['name'] for repo in repos]
+    }
+
+    with open('repo_info.json', 'w') as f:
+        json.dump(info, f, indent=4)
+
 def main():
+    # Load the CSV mapping
+    csv_file_path = 'project_repo_mapping.csv'
+    project_repo_map = load_project_repo_mapping(csv_file_path)
+
     # Initialize the DB
     init_db()
 
@@ -260,7 +340,8 @@ def main():
     for repo in repos:
         repo_slug = repo['slug']
         repo_name = repo['name']
-        if clone_or_update_repository(repo_slug, repo_name):
+        # Pass the project_repo_map to clone_or_update_repository
+        if clone_or_update_repository(repo_slug, repo_name, project_repo_map):
             updated_repos.append(repo_name)
 
 if __name__ == '__main__':

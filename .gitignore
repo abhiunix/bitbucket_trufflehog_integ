@@ -1,8 +1,9 @@
 .env
-all_repos
+all_repos/
 all_repos*
 all_repos_small
 all_repos_bkp
+*.csv
 *.db
 *.json
 Results/
@@ -10,3 +11,4 @@ Analysis.txt
 repo_info.json
 repo_tracker.db
 update_db.py
+*.txt
